@@ -6509,3 +6509,96 @@ fn save_to_image_path_is_an_error_not_zip_bytes() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn flip_is_refused_on_a_smartart_graphic_and_leaves_it_a_graphic() {
+    let mut s = session();
+    s.execute("slide.new", &json!({"layout": "blank"})).unwrap();
+    s.execute("insert.textBox", &json!({"text": "Goals\nRevenue"})).unwrap();
+    let gid = s.execute("smartArt.fromText", &json!({"kind": "blockList"})).unwrap()["id"].as_u64().unwrap();
+    for cmd in ["arrange.flipHorizontal", "arrange.flipVertical", "shape.flip"] {
+        let e = s.execute(cmd, &json!({"ids": [gid]})).unwrap_err().to_string();
+        assert!(e.contains("SmartArt") && e.contains("smartArt.layout"), "{cmd}: {e}");
+    }
+    // Grouped with another shape it cannot be flipped either: ungrouping would hand it the flip.
+    let other = s.execute("insert.textBox", &json!({"text": "x"})).unwrap()["id"].as_u64().unwrap();
+    let group = s.execute("arrange.group", &json!({"ids": [gid, other]})).unwrap()["id"].as_u64().unwrap();
+    let e = s.execute("shape.flip", &json!({"ids": [group]})).unwrap_err().to_string();
+    assert!(e.contains("SmartArt"), "{e}");
+    s.execute("arrange.ungroup", &json!({"ids": [group]})).unwrap();
+    // Still a SmartArt graphic: smartArt commands keep working.
+    s.execute("smartArt.layout", &json!({"id": gid, "kind": "cycle"})).unwrap();
+    // Ordinary shapes still flip.
+    let b = s.execute("insert.textBox", &json!({"text": "x"})).unwrap();
+    let id = b["id"].as_u64().unwrap();
+    assert_eq!(s.execute("arrange.flipHorizontal", &json!({"ids": [id]})).unwrap(), json!(1));
+}
+
+/// Table cell commands refuse a `cells` that is not a list of [row, col] cells in the table,
+/// instead of dropping the entry or reading the list as absent (which acts on the selection).
+#[test]
+fn table_cell_commands_refuse_a_malformed_cells_list() {
+    let mut s = session();
+    let t = table_at(&mut s, &[100.0, 100.0], json!([["a", "b"], ["c", "d"]]));
+    let rev = s.doc().unwrap().revision;
+    for cells in [
+        json!([[-1, 0]]),
+        json!([[0]]),
+        json!([[0, 0], "x"]),
+        json!([[0, 0, "x"]]),
+        json!([[0, 2]]),
+        json!([[0, u64::MAX]]),
+        json!("0,0"),
+        json!({"0": 0}),
+    ] {
+        for (cmd, extra) in [
+            ("table.cellFill", json!({"color": "#FF0000"})),
+            ("table.cellMargins", json!({"left": 4})),
+            ("table.cellAlign", json!({"align": "center"})),
+            ("table.borders", json!({"which": "right"})),
+        ] {
+            let mut p = extra.clone();
+            p["id"] = json!(t);
+            p["cells"] = cells.clone();
+            let e = s.execute(cmd, &p).unwrap_err().to_string();
+            assert!(e.contains(cmd) && e.contains("cell"), "{cmd} {cells}: {e}");
+        }
+    }
+    assert_eq!(s.doc().unwrap().revision, rev, "nothing changed");
+    let many = json!(vec![[0, 0]; 100_001]);
+    assert!(s.execute("table.cellFill", &json!({"id": t, "color": "#FF0000", "cells": many})).unwrap_err().to_string().contains("at most"));
+    s.execute("table.cellFill", &json!({"id": t, "color": "#FF0000", "cells": [[1, 1]]})).unwrap();
+    assert!(table_of(&s, t).cell(1, 1).unwrap().fill.is_some() && table_of(&s, t).cell(0, 0).unwrap().fill.is_none());
+}
+
+/// The outline exports (PowerPoint's outline view) holds titles and body text only: footer,
+/// date and slide-number placeholders are not body lines.
+#[test]
+fn outline_export_skips_footer_date_and_slide_number() {
+    let mut s = session();
+    s.execute("slide.new", &json!({"layout": "titleAndContent", "title": "Agenda", "body": "First point\nSecond point"})).unwrap();
+    s.execute(
+        "design.headerFooter",
+        &json!({"footer": true, "footerText": "Company Confidential", "slideNumber": true, "date": true, "dateText": "1 May 2026"}),
+    )
+    .unwrap();
+    let dir = std::env::temp_dir().join(format!("deckcraft-outline-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("deck.md");
+    s.execute("file.export", &json!({"path": path.to_string_lossy(), "format": "outline"})).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(text.contains("Agenda") && text.contains("First point") && text.contains("Second point"), "{text:?}");
+    assert!(!text.contains("Company Confidential"), "footer text is not a body line: {text:?}");
+    assert!(!text.contains("‹#›"), "the slide-number field is not a body line: {text:?}");
+    assert!(!text.contains("1 May 2026"), "the date is not a body line: {text:?}");
+    // The RTF outline (Save As ▸ Outline/RTF) too.
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("deck.rtf");
+    s.execute("file.export", &json!({"path": path.to_string_lossy(), "format": "rtf"})).unwrap();
+    let rtf = std::fs::read_to_string(&path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(rtf.contains("Agenda") && rtf.contains("First point"), "{rtf:?}");
+    assert!(!rtf.contains("Company Confidential") && !rtf.contains("1 May 2026"), "{rtf:?}");
+}
